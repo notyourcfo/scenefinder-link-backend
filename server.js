@@ -19,7 +19,7 @@ app.use(cors());
 app.use(express.json());
 
 // Ensure uploads directory exists
-const uploadDir = path.join(__dirname, 'uploads');
+const uploadDir = path.join(__dirname, 'Uploads');
 try {
   if (!fs.existsSync(uploadDir)) {
     fs.mkdirSync(uploadDir, { recursive: true });
@@ -29,6 +29,24 @@ try {
   process.exit(1);
 }
 
+// Retry function for handling 429 errors
+async function withRetry(fn, retries = 3, initialDelay = 5000) {
+  let delay = initialDelay;
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (error.statusCode === 429 && i < retries - 1) {
+        console.log(`Rate limit hit, retrying in ${delay}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        delay *= 2; // Exponential backoff
+      } else {
+        throw error;
+      }
+    }
+  }
+}
+
 // Health check endpoint
 app.get('/', (req, res) => {
   res.status(200).json({ status: 'OK', message: 'SceneFinder link backend is running' });
@@ -36,33 +54,46 @@ app.get('/', (req, res) => {
 
 // Analyze link endpoint
 app.post('/api/analyze-link', async (req, res) => {
+  let audioPath;
   try {
     const { url } = req.body;
     if (!url || typeof url !== 'string') {
       return res.status(400).json({ error: 'Invalid or missing URL' });
     }
 
-    let audioPath;
-    const tempFilePath = path.join(uploadDir, `temp-${Date.now()}.mp3`);
+    audioPath = path.join(uploadDir, `temp-${Date.now()}.mp3`);
+
+    // Check available disk space (approximate)
+    try {
+      const stats = fs.statfsSync(uploadDir);
+      const freeMB = (stats.bavail * stats.bsize) / (1024 * 1024);
+      if (freeMB < 50) {
+        console.warn(`Low disk space: ${freeMB.toFixed(2)} MB available`);
+        return res.status(500).json({ error: 'Insufficient disk space for processing' });
+      }
+    } catch (error) {
+      console.error('Failed to check disk space:', error);
+    }
 
     // Identify platform and download audio
     if (ytdl.validateURL(url)) {
       // YouTube
       console.log('Processing YouTube URL:', url);
       try {
-        const stream = ytdl(url, { filter: 'audioonly', quality: 'highestaudio' });
-        audioPath = tempFilePath;
-        const fileStream = fs.createWriteStream(audioPath);
-        stream.pipe(fileStream);
+        await withRetry(async () => {
+          const stream = ytdl(url, { filter: 'audioonly', quality: 'highestaudio' });
+          const fileStream = fs.createWriteStream(audioPath);
+          stream.pipe(fileStream);
 
-        await new Promise((resolve, reject) => {
-          fileStream.on('finish', resolve);
-          fileStream.on('error', reject);
-          stream.on('error', (err) => reject(err));
+          await new Promise((resolve, reject) => {
+            fileStream.on('finish', resolve);
+            fileStream.on('error', reject);
+            stream.on('error', (err) => reject(err));
+          });
         });
       } catch (error) {
         console.error('YouTube processing failed:', error);
-        if (error.message.includes('429')) {
+        if (error.statusCode === 429) {
           return res.status(429).json({ error: 'YouTube rate limit exceeded. Try again later.' });
         }
         return res.status(400).json({ error: 'Failed to process YouTube URL. Ensure it is a valid, public video.' });
@@ -71,22 +102,23 @@ app.post('/api/analyze-link', async (req, res) => {
       // Instagram
       console.log('Processing Instagram URL:', url);
       try {
-        const response = await instagramGetUrl(url);
-        console.log('Instagram response:', response);
-        if (!response.results_number || !response.url_list?.[0]) {
-          return res.status(400).json({ error: 'Invalid or inaccessible Instagram video URL' });
-        }
-        const videoUrl = response.url_list[0];
-        console.log('Instagram video URL:', videoUrl);
-        const videoResponse = await axios.get(videoUrl, { responseType: 'stream' });
+        await withRetry(async () => {
+          const response = await instagramGetUrl(url);
+          console.log('Instagram response:', response);
+          if (!response.results_number || !response.url_list?.[0]) {
+            throw new Error('Invalid or inaccessible Instagram video URL');
+          }
+          const videoUrl = response.url_list[0];
+          console.log('Instagram video URL:', videoUrl);
+          const videoResponse = await axios.get(videoUrl, { responseType: 'stream', timeout: 30000 });
 
-        audioPath = tempFilePath;
-        const fileStream = fs.createWriteStream(audioPath);
-        videoResponse.data.pipe(fileStream);
+          const fileStream = fs.createWriteStream(audioPath);
+          videoResponse.data.pipe(fileStream);
 
-        await new Promise((resolve, reject) => {
-          fileStream.on('finish', resolve);
-          fileStream.on('error', reject);
+          await new Promise((resolve, reject) => {
+            fileStream.on('finish', resolve);
+            fileStream.on('error', reject);
+          });
         });
       } catch (error) {
         console.error('Instagram URL processing failed:', error);
@@ -96,19 +128,18 @@ app.post('/api/analyze-link', async (req, res) => {
       return res.status(400).json({ error: 'Unsupported URL. Only YouTube and Instagram links are supported.' });
     }
 
+    // Verify audio file exists and has size
+    if (!fs.existsSync(audioPath) || fs.statSync(audioPath).size === 0) {
+      console.error('Audio file is missing or empty:', audioPath);
+      return res.status(500).json({ error: 'Failed to generate audio file' });
+    }
+
     // Transcribe audio using Whisper
     console.log('Transcribing audio from:', audioPath);
     const transcription = await openai.audio.transcriptions.create({
       file: fs.createReadStream(audioPath),
       model: 'whisper-1',
     });
-
-    // Clean up temporary file
-    try {
-      fs.unlinkSync(audioPath);
-    } catch (error) {
-      console.error('Failed to delete temporary file:', error);
-    }
 
     // Query GPT-4o for scene details
     const prompt = `
@@ -139,6 +170,16 @@ app.post('/api/analyze-link', async (req, res) => {
   } catch (error) {
     console.error('Error processing link:', error);
     res.status(500).json({ error: error.message || 'Internal server error' });
+  } finally {
+    // Clean up temporary file
+    if (audioPath && fs.existsSync(audioPath)) {
+      try {
+        fs.unlinkSync(audioPath);
+        console.log('Cleaned up:', audioPath);
+      } catch (error) {
+        console.error('Failed to delete temporary file:', error);
+      }
+    }
   }
 });
 

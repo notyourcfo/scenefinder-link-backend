@@ -29,15 +29,15 @@ try {
   process.exit(1);
 }
 
-// Retry function for handling 429 errors
-async function withRetry(fn, retries = 3, initialDelay = 5000) {
+// Retry function for handling 429 and 401 errors
+async function withRetry(fn, retries = 5, initialDelay = 10000) {
   let delay = initialDelay;
   for (let i = 0; i < retries; i++) {
     try {
       return await fn();
     } catch (error) {
-      if (error.statusCode === 429 && i < retries - 1) {
-        console.log(`Rate limit hit, retrying in ${delay}ms...`);
+      if ((error.statusCode === 429 || error.statusCode === 401) && i < retries - 1) {
+        console.log(`Error ${error.statusCode}, retrying in ${delay}ms...`);
         await new Promise(resolve => setTimeout(resolve, delay));
         delay *= 2; // Exponential backoff
       } else {
@@ -63,7 +63,7 @@ app.post('/api/analyze-link', async (req, res) => {
 
     audioPath = path.join(uploadDir, `temp-${Date.now()}.mp3`);
 
-    // Check available disk space (approximate)
+    // Check available disk space
     try {
       const stats = fs.statfsSync(uploadDir);
       const freeMB = (stats.bavail * stats.bsize) / (1024 * 1024);
@@ -94,7 +94,7 @@ app.post('/api/analyze-link', async (req, res) => {
       } catch (error) {
         console.error('YouTube processing failed:', error);
         if (error.statusCode === 429) {
-          return res.status(429).json({ error: 'YouTube rate limit exceeded. Try again later.' });
+          return res.status(429).json({ error: 'YouTube rate limit exceeded. Please try again later.' });
         }
         return res.status(400).json({ error: 'Failed to process YouTube URL. Ensure it is a valid, public video.' });
       }
@@ -128,7 +128,7 @@ app.post('/api/analyze-link', async (req, res) => {
       return res.status(400).json({ error: 'Unsupported URL. Only YouTube and Instagram links are supported.' });
     }
 
-    // Verify audio file exists and has size
+    // Verify audio file
     if (!fs.existsSync(audioPath) || fs.statSync(audioPath).size === 0) {
       console.error('Audio file is missing or empty:', audioPath);
       return res.status(500).json({ error: 'Failed to generate audio file' });

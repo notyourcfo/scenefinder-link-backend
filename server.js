@@ -30,7 +30,7 @@ try {
 }
 
 // Retry function for handling 429 and 401 errors
-async function withRetry(fn, retries = 5, initialDelay = 10000) {
+async function withRetry(fn, retries = 7, initialDelay = 15000) {
   let delay = initialDelay;
   for (let i = 0; i < retries; i++) {
     try {
@@ -110,7 +110,13 @@ app.post('/api/analyze-link', async (req, res) => {
           }
           const videoUrl = response.url_list[0];
           console.log('Instagram video URL:', videoUrl);
-          const videoResponse = await axios.get(videoUrl, { responseType: 'stream', timeout: 30000 });
+          const videoResponse = await axios.get(videoUrl, {
+            responseType: 'stream',
+            timeout: 30000,
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+          });
 
           const fileStream = fs.createWriteStream(audioPath);
           videoResponse.data.pipe(fileStream);
@@ -138,7 +144,7 @@ app.post('/api/analyze-link', async (req, res) => {
     console.log('Transcribing audio from:', audioPath);
     const transcription = await openai.audio.transcriptions.create({
       file: fs.createReadStream(audioPath),
-      model: 'whisper-1',
+      model: 'whisper-1'
     });
 
     // Query GPT-4o for scene details
@@ -158,14 +164,14 @@ app.post('/api/analyze-link', async (req, res) => {
     const gptResponse = await openai.chat.completions.create({
       model: 'gpt-4o',
       messages: [{ role: 'user', content: prompt }],
-      response_format: { type: 'json_object' },
+      response_format: { type: 'json_object' }
     });
 
     const sceneDetails = JSON.parse(gptResponse.choices[0].message.content);
 
     res.status(200).json({
       success: true,
-      data: sceneDetails,
+      data: sceneDetails
     });
   } catch (error) {
     console.error('Error processing link:', error);

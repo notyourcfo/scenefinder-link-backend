@@ -6,6 +6,7 @@ const { instagramGetUrl } = require('instagram-url-direct');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
+const rateLimit = require('express-rate-limit');
 
 require('dotenv').config();
 
@@ -17,6 +18,13 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 // Middleware
 app.use(cors());
 app.use(express.json());
+
+// Rate limiting for /api/analyze-link
+app.use('/api/analyze-link', rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 50, // 50 requests per IP
+  message: 'Too many requests, please try again later.'
+}));
 
 // Ensure uploads directory exists
 const uploadDir = path.join(__dirname, 'Uploads');
@@ -30,7 +38,7 @@ try {
 }
 
 // Retry function for handling 429 and 401 errors
-async function withRetry(fn, retries = 7, initialDelay = 15000) {
+async function withRetry(fn, retries = 3, initialDelay = 5000) {
   let delay = initialDelay;
   for (let i = 0; i < retries; i++) {
     try {
@@ -67,9 +75,10 @@ app.post('/api/analyze-link', async (req, res) => {
     try {
       const stats = fs.statfsSync(uploadDir);
       const freeMB = (stats.bavail * stats.bsize) / (1024 * 1024);
+      console.log(`Available disk space: ${freeMB.toFixed(2)} MB`);
       if (freeMB < 50) {
         console.warn(`Low disk space: ${freeMB.toFixed(2)} MB available`);
-        return res.status(500).json({ error: 'Insufficient disk space for processing' });
+        return res.status(500).json({ error: `Insufficient disk space: ${freeMB.toFixed(2)} MB available` });
       }
     } catch (error) {
       console.error('Failed to check disk space:', error);
@@ -81,22 +90,31 @@ app.post('/api/analyze-link', async (req, res) => {
       console.log('Processing YouTube URL:', url);
       try {
         await withRetry(async () => {
-          const stream = ytdl(url, { filter: 'audioonly', quality: 'highestaudio' });
+          const cookies = process.env.LOGIN_INFO || '';
+          const stream = ytdl(url, {
+            filter: 'audioonly',
+            quality: 'highestaudio',
+            requestOptions: {
+              headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+                cookie: cookies
+              }
+            }
+          });
           const fileStream = fs.createWriteStream(audioPath);
           stream.pipe(fileStream);
-
           await new Promise((resolve, reject) => {
             fileStream.on('finish', resolve);
             fileStream.on('error', reject);
             stream.on('error', (err) => reject(err));
           });
-        });
+        }, 3, 5000);
       } catch (error) {
-        console.error('YouTube processing failed:', error);
+        console.error('YouTube error details:', JSON.stringify(error, null, 2));
         if (error.statusCode === 429) {
           return res.status(429).json({ error: 'YouTube rate limit exceeded. Please try again later.' });
         }
-        return res.status(400).json({ error: 'Failed to process YouTube URL. Ensure it is a valid, public video.' });
+        return res.status(400).json({ error: `Failed to process YouTube URL: ${error.message}` });
       }
     } else if (url.includes('instagram.com')) {
       // Instagram
@@ -104,7 +122,7 @@ app.post('/api/analyze-link', async (req, res) => {
       try {
         await withRetry(async () => {
           const response = await instagramGetUrl(url);
-          console.log('Instagram response:', response);
+          console.log('Instagram API response:', JSON.stringify(response, null, 2));
           if (!response.results_number || !response.url_list?.[0]) {
             throw new Error('Invalid or inaccessible Instagram video URL');
           }
@@ -114,21 +132,21 @@ app.post('/api/analyze-link', async (req, res) => {
             responseType: 'stream',
             timeout: 30000,
             headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
             }
           });
-
           const fileStream = fs.createWriteStream(audioPath);
           videoResponse.data.pipe(fileStream);
-
           await new Promise((resolve, reject) => {
             fileStream.on('finish', resolve);
             fileStream.on('error', reject);
           });
-        });
+        }, 3, 5000);
       } catch (error) {
-        console.error('Instagram URL processing failed:', error);
-        return res.status(400).json({ error: 'Failed to process Instagram URL. Ensure it is a public video or reel.' });
+        console.error('Instagram error details:', JSON.stringify(error, null, 2));
+        return res.status(400).json({
+          error: 'Instagram processing failed. This feature is limited due to platform restrictions. Please use a public reel or try a YouTube URL.'
+        });
       }
     } else {
       return res.status(400).json({ error: 'Unsupported URL. Only YouTube and Instagram links are supported.' });
@@ -174,7 +192,7 @@ app.post('/api/analyze-link', async (req, res) => {
       data: sceneDetails
     });
   } catch (error) {
-    console.error('Error processing link:', error);
+    console.error('Error processing link:', JSON.stringify(error, null, 2));
     res.status(500).json({ error: error.message || 'Internal server error' });
   } finally {
     // Clean up temporary file
